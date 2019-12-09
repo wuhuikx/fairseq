@@ -54,16 +54,15 @@
 
 ### Decoder ###
 
-    - input: src_tockens, 按time_step依次输入一个/两个/三个etc个单词
-      每个单词对应扩充为beam_size维 [batch_size*beam_]
+- input: src_tockens, 按time_step依次输入一个/两个/三个etc个单词
+  每个单词对应扩充为beam_size维 [batch_size*beam_size]
 
-    - embedding part
-      - data_embedding + position_embedding
-        将prev_output_tokens [640, 1] embedding成 [640, 1, 1024]
+- embedding part
+  - data_embedding + position_embedding
+    将prev_output_tokens [640, 1] embedding成 [640, 1, 1024]
 
-    - decoder part
-      - Masked Multi-Head Attention， 当前decoder的单词与后续(之后time step)的单词无关
+- decoder part
+  - Masked Multi-Head Attention， 当前decoder的单词与后续(之后time step)的单词无关
 
-    - sequence_generator part
-      - 一直重复embedding + decoder直到遇到结束符或者句子长度超过最大长度为止
-
+- sequence_generator part
+  - 一直重复embedding + decoder直到遇到结束符或者句子长度超过最大长度为止
