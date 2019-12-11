@@ -3,6 +3,7 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+import os
 import math
 import torch
 from torch import nn
@@ -17,6 +18,7 @@ from torch.quantization import \
 from torch.quantization import \
     quantize, prepare, convert, prepare_qat, quantize_qat, fuse_modules
 
+from torch.utils import mkldnn as mkldnn_utils
 cur_qconfig = default_qconfig #default_per_channel_qconfig#default_qconfig
 
 
@@ -79,6 +81,9 @@ class MultiheadAttention(nn.Module):
         #    self.enable_torch_version = True
         #else:
         #    self.enable_torch_version = False
+        self.use_mkldnn = False
+        if os.environ.get('device') == "mkldnn":
+            self.use_mkldnn = True
 
     def prepare_for_onnx_export_(self):
         self.onnx_trace = True
@@ -177,6 +182,12 @@ class MultiheadAttention(nn.Module):
         else:
             saved_state = None
 
+        if self.use_mkldnn:
+            self.q_proj = mkldnn_utils.to_mkldnn(self.q_proj)
+            self.k_proj = mkldnn_utils.to_mkldnn(self.k_proj)
+            self.v_proj = mkldnn_utils.to_mkldnn(self.v_proj)
+            self.out_proj = mkldnn_utils.to_mkldnn(self.out_proj)
+        
         if self.self_attention:
             query = self.quant_q(query)
             q = self.q_proj(query)

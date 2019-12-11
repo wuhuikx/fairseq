@@ -15,6 +15,7 @@ from fairseq.meters import StopwatchMeter, TimeMeter
 
 from torch.quantization import \
     quantize, prepare, convert, prepare_qat, quantize_qat, fuse_modules
+from torch.utils import mkldnn as mkldnn_utils
 
 def savefile(filename, table):
     with open(filename, "w") as outfile:
@@ -133,6 +134,10 @@ def main(args):
 
     if os.environ.get('INT8') == "1":
         state_dict = torch.load("./int8_model.pt")
+        torch.backends.quantized.engine = 'fbgemm'
+        if os.environ.get('device') == "mkldnn":
+            torch.backends.quantized.engine = 'mkldnn'
+        
         prepare(models[0], inplace=True)
         convert(models[0], inplace=True)
         models[0].load_state_dict(state_dict)
@@ -149,7 +154,6 @@ def main(args):
                 sample = utils.move_to_cuda(sample) if use_cuda else sample
                 if 'net_input' not in sample:
                     continue
-
                 prefix_tokens = None
                 if args.prefix_size > 0:
                     prefix_tokens = sample['target'][:, :args.prefix_size]

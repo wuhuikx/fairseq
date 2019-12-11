@@ -2,7 +2,7 @@
 
 #export CALIB=1 # for int8 calibration
 export INT8=1 # to run int8 model
-
+export device='mkldnn'
 # profiling
 # export SAMPLE_PROFILE=1 # profile each iteration
 # export GLOBAL_PROFILE=1 # profile the total iteration

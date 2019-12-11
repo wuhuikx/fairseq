@@ -3,12 +3,13 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from fairseq import utils
 from fairseq.modules import LayerNorm, MultiheadAttention
-
+from torch.utils import mkldnn as mkldnn_utils
 
 class TransformerEncoderLayer(nn.Module):
     """Encoder layer block.
@@ -46,6 +47,10 @@ class TransformerEncoderLayer(nn.Module):
         self.fc2 = Linear(args.encoder_ffn_embed_dim, self.embed_dim)
         self.final_layer_norm = LayerNorm(self.embed_dim)
 
+        self.use_mkldnn = False
+        if os.environ.get('device') == "mkldnn":
+            self.use_mkldnn = True
+	    
     def upgrade_state_dict_named(self, state_dict, name):
         """
         Rename layer norm states from `...layer_norms.0.weight` to
@@ -99,8 +104,13 @@ class TransformerEncoderLayer(nn.Module):
 
         residual = x
         x = self.maybe_layer_norm(self.final_layer_norm, x, before=True)
-        x = self.activation_fn(self.fc1(x))
+        if self.use_mkldnn:
+            self.fc1 = mkldnn_utils.to_mkldnn(self.fc1)
+        x = self.fc1(x)
+        x = self.activation_fn(x)
         x = F.dropout(x, p=self.activation_dropout, training=self.training)
+        if self.use_mkldnn:
+            self.fc2 = mkldnn_utils.to_mkldnn(self.fc2)
         x = self.fc2(x)
         x = F.dropout(x, p=self.dropout, training=self.training)
         x = residual + x
@@ -181,6 +191,10 @@ class TransformerDecoderLayer(nn.Module):
         self.need_attn = True
 
         self.onnx_trace = False
+
+        self.use_mkldnn = False
+        if os.environ.get('device') == "mkldnn":
+            self.use_mkldnn = True
 
     def prepare_for_onnx_export_(self):
         self.onnx_trace = True
@@ -277,8 +291,12 @@ class TransformerDecoderLayer(nn.Module):
 
         residual = x
         x = self.maybe_layer_norm(self.final_layer_norm, x, before=True)
+        if self.use_mkldnn:
+            self.fc1 = mkldnn_utils.to_mkldnn(self.fc1)
         x = self.activation_fn(self.fc1(x))
         x = F.dropout(x, p=self.activation_dropout, training=self.training)
+        if self.use_mkldnn:
+            self.fc2 = mkldnn_utils.to_mkldnn(self.fc2)
         x = self.fc2(x)
         x = F.dropout(x, p=self.dropout, training=self.training)
         x = residual + x

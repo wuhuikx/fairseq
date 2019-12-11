@@ -6,6 +6,7 @@
 # generator.py
 # fairseq/sequence_generator.py
 # fairseq/models/transformer.py
+# fairseq/modules/transformer_layer.py
 # fairseq/modules/multihead_attention.py
 ```
 ## Code Reading 
