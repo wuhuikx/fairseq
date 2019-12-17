@@ -48,7 +48,7 @@ class TransformerEncoderLayer(nn.Module):
         self.final_layer_norm = LayerNorm(self.embed_dim)
 
         self.use_mkldnn = False
-        if os.environ.get('device') == "mkldnn":
+        if os.environ.get('engine') == "mkldnn":
             self.use_mkldnn = True
 	    
     def upgrade_state_dict_named(self, state_dict, name):
@@ -193,7 +193,7 @@ class TransformerDecoderLayer(nn.Module):
         self.onnx_trace = False
 
         self.use_mkldnn = False
-        if os.environ.get('device') == "mkldnn":
+        if os.environ.get('engine') == "mkldnn":
             self.use_mkldnn = True
 
     def prepare_for_onnx_export_(self):

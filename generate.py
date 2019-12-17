@@ -8,10 +8,27 @@ Translate pre-processed data with a trained model.
 """
 
 import torch
+import os 
 
 from fairseq import bleu, checkpoint_utils, options, progress_bar, tasks, utils
 from fairseq.meters import StopwatchMeter, TimeMeter
 
+from torch.quantization import \
+    quantize, prepare, convert, prepare_qat, quantize_qat, fuse_modules
+from torch.utils import mkldnn as mkldnn_utils
+
+def savefile(filename, table):
+    with open(filename, "w") as outfile:
+        outfile.write("{0} , {1} , {2} , {3} , {4}, {5}, {6}, {7}, {8}, {9}\n".format("Name", \
+                  "Self CPU total %", "Self CPU total", "CPU total %", "CPU total", \
+                  "CPU time avg", "CUDA total %", "CUDA total", "CUDA time avg", "Number of Calls"))
+        lines = table.split("\n")
+        for i in range(3,len(lines)-4):
+            words = lines[i].split(" ")
+            for word in words:
+                if not word == "":
+                    outfile.write("{0} , ".format(word)) 
+            outfile.write("\n")
 
 def main(args):
     assert args.path is not None, '--path required for generation!'
@@ -41,12 +58,14 @@ def main(args):
 
     # Load ensemble
     print('| loading model(s) from {}'.format(args.path))
+    import os 
     models, _model_args = checkpoint_utils.load_model_ensemble(
         args.path.split(':'),
         arg_overrides=eval(args.model_overrides),
         task=task,
     )
-
+       
+    
     # Optimize ensemble for generation
     for model in models:
         model.make_generation_fast_(
@@ -57,6 +76,8 @@ def main(args):
             model.half()
         if use_cuda:
             model.cuda()
+    print("---models={}".format(models))
+    #models[0].save_pretrained('/home/huiwu1/workspace/data-bin/qmodel.pt')
 
     # Load alignment dictionary for unknown word replacement
     # (None if no unknown word replacement, empty if no path to align dictionary)
@@ -87,103 +108,153 @@ def main(args):
         scorer = bleu.SacrebleuScorer()
     else:
         scorer = bleu.Scorer(tgt_dict.pad(), tgt_dict.eos(), tgt_dict.unk())
-    num_sentences = 0
-    has_target = True
-    with progress_bar.build_progress_bar(args, itr) as t:
-        wps_meter = TimeMeter()
-        for sample in t:
-            sample = utils.move_to_cuda(sample) if use_cuda else sample
-            if 'net_input' not in sample:
-                continue
-
+ 
+    if args.calib:
+        print("------calibration-------")
+        iters=0
+        for model in models:
+            prepare(model, inplace=True)
+            
+        for sample in itr:
             prefix_tokens = None
             if args.prefix_size > 0:
                 prefix_tokens = sample['target'][:, :args.prefix_size]
-
-            gen_timer.start()
             hypos = task.inference_step(generator, models, sample, prefix_tokens)
-            num_generated_tokens = sum(len(h[0]['tokens']) for h in hypos)
-            gen_timer.stop(num_generated_tokens)
+            iters += 1 
+            if iters > 300:
+                break
+            
+        for model in models:
+            convert(model, inplace=True)
+        int8_model_path = args.path.split('.pt')[0] + '_int8.pt' 
+        torch.save(models[0].state_dict(), int8_model_path)
+        return
 
-            for i, sample_id in enumerate(sample['id'].tolist()):
-                has_target = sample['target'] is not None
+    if args.int8:
+        int8_model_path = args.path.split('.pt')[0] + '_int8.pt' 
+        state_dict = torch.load(int8_model_path)
+        torch.backends.quantized.engine = "fbgemm" 
+        if os.environ.get('engine') == "mkldnn":
+            torch.backends.quantized.engine = "mkldnn" 
+        
+        prepare(models[0], inplace=True)
+        convert(models[0], inplace=True)
+        models[0].load_state_dict(state_dict)
 
-                # Remove padding
-                src_tokens = utils.strip_pad(sample['net_input']['src_tokens'][i, :], tgt_dict.pad())
-                target_tokens = None
-                if has_target:
-                    target_tokens = utils.strip_pad(sample['target'][i, :], tgt_dict.pad()).int().cpu()
-
-                # Either retrieve the original sentences or regenerate them from tokens.
-                if align_dict is not None:
-                    src_str = task.dataset(args.gen_subset).src.get_original_text(sample_id)
-                    target_str = task.dataset(args.gen_subset).tgt.get_original_text(sample_id)
+    def inference(args, itr, generator, models, scorer, gen_timer):
+        num_sentences = 0
+        has_target = True
+        nbatch = 0
+        output_dir = os.environ.get('OUTPUT_DIR')
+        with progress_bar.build_progress_bar(args, itr) as t:
+            wps_meter = TimeMeter()
+            for sample in t:
+                sample = utils.move_to_cuda(sample) if use_cuda else sample
+                if 'net_input' not in sample:
+                    continue
+                prefix_tokens = None
+                if args.prefix_size > 0:
+                    prefix_tokens = sample['target'][:, :args.prefix_size]
+            
+                if os.environ.get('SAMPLE_PROFILE') == "1": 
+                    with torch.autograd.profiler.profile() as prof:
+                        gen_timer.start()
+                        hypos = task.inference_step(generator, models, sample, prefix_tokens)
+                        num_generated_tokens = sum(len(h[0]['tokens']) for h in hypos)
+                        gen_timer.stop(num_generated_tokens)
+                    table_res = prof.key_averages().table(sort_by="self_cpu_time_total")
+                    filename = os.path.join(output_dir + '/result_' + str(nbatch) + '.csv')
+                    savefile(filename, table_res)
+                    nbatch += 1
                 else:
-                    if src_dict is not None:
-                        src_str = src_dict.string(src_tokens, args.remove_bpe)
+                    gen_timer.start()
+                    hypos = task.inference_step(generator, models, sample, prefix_tokens)
+                    num_generated_tokens = sum(len(h[0]['tokens']) for h in hypos)
+                    gen_timer.stop(num_generated_tokens)
+                
+                for i, sample_id in enumerate(sample['id'].tolist()):
+                    has_target = sample['target'] is not None
+
+                    # Remove padding
+                    src_tokens = utils.strip_pad(sample['net_input']['src_tokens'][i, :], tgt_dict.pad())
+                    target_tokens = None
+                    if has_target:
+                        target_tokens = utils.strip_pad(sample['target'][i, :], tgt_dict.pad()).int().cpu()
+
+                    # Either retrieve the original sentences or regenerate them from tokens.
+                    if align_dict is not None:
+                        src_str = task.dataset(args.gen_subset).src.get_original_text(sample_id)
+                        target_str = task.dataset(args.gen_subset).tgt.get_original_text(sample_id)
                     else:
-                        src_str = ""
-                    if has_target:
-                        target_str = tgt_dict.string(target_tokens, args.remove_bpe, escape_unk=True)
-
-                if not args.quiet:
-                    if src_dict is not None:
-                        print('S-{}\t{}'.format(sample_id, src_str))
-                    if has_target:
-                        print('T-{}\t{}'.format(sample_id, target_str))
-
-                # Process top predictions
-                for j, hypo in enumerate(hypos[i][:args.nbest]):
-                    hypo_tokens, hypo_str, alignment = utils.post_process_prediction(
-                        hypo_tokens=hypo['tokens'].int().cpu(),
-                        src_str=src_str,
-                        alignment=hypo['alignment'],
-                        align_dict=align_dict,
-                        tgt_dict=tgt_dict,
-                        remove_bpe=args.remove_bpe,
-                    )
+                        if src_dict is not None:
+                            src_str = src_dict.string(src_tokens, args.remove_bpe)
+                        else:
+                            src_str = ""
+                        if has_target:
+                            target_str = tgt_dict.string(target_tokens, args.remove_bpe, escape_unk=True)
 
                     if not args.quiet:
-                        print('H-{}\t{}\t{}'.format(sample_id, hypo['score'], hypo_str))
-                        print('P-{}\t{}'.format(
-                            sample_id,
-                            ' '.join(map(
-                                lambda x: '{:.4f}'.format(x),
-                                hypo['positional_scores'].tolist(),
-                            ))
-                        ))
+                        if src_dict is not None:
+                            print('S-{}\t{}'.format(sample_id, src_str))
+                        if has_target:
+                            print('T-{}\t{}'.format(sample_id, target_str))
 
-                        if args.print_alignment:
-                            print('A-{}\t{}'.format(
+                    # Process top predictions
+                    for j, hypo in enumerate(hypos[i][:args.nbest]):
+                        hypo_tokens, hypo_str, alignment = utils.post_process_prediction(
+                            hypo_tokens=hypo['tokens'].int().cpu(),
+                            src_str=src_str,
+                            alignment=hypo['alignment'],
+                            align_dict=align_dict,
+                            tgt_dict=tgt_dict,
+                            remove_bpe=args.remove_bpe,
+                        )
+
+                        if not args.quiet:
+                            print('H-{}\t{}\t{}'.format(sample_id, hypo['score'], hypo_str))
+                            print('P-{}\t{}'.format(
                                 sample_id,
-                                ' '.join(['{}-{}'.format(src_idx, tgt_idx) for src_idx, tgt_idx in alignment])
+                                ' '.join(map(
+                                    lambda x: '{:.4f}'.format(x),
+                                    hypo['positional_scores'].tolist(),
+                                ))
                             ))
 
-                        if args.print_step:
-                            print('I-{}\t{}'.format(sample_id, hypo['steps']))
+                            if args.print_alignment:
+                                print('A-{}\t{}'.format(
+                                    sample_id,
+                                    ' '.join(['{}-{}'.format(src_idx, tgt_idx) for src_idx, tgt_idx in alignment])
+                                ))
 
-                        if getattr(args, 'retain_iter_history', False):
-                            print("\n".join([
-                                    'E-{}_{}\t{}'.format(
-                                        sample_id, step,
-                                        utils.post_process_prediction(
-                                            h['tokens'].int().cpu(),
-                                            src_str, None, None, tgt_dict, None)[1])
-                                        for step, h in enumerate(hypo['history'])]))
+                            if args.print_step:
+                                print('I-{}\t{}'.format(sample_id, hypo['steps']))
 
-                    # Score only the top hypothesis
-                    if has_target and j == 0:
-                        if align_dict is not None or args.remove_bpe is not None:
-                            # Convert back to tokens for evaluation with unk replacement and/or without BPE
-                            target_tokens = tgt_dict.encode_line(target_str, add_if_not_exist=True)
-                        if hasattr(scorer, 'add_string'):
-                            scorer.add_string(target_str, hypo_str)
-                        else:
-                            scorer.add(target_tokens, hypo_tokens)
+                        # Score only the top hypothesis
+                        if has_target and j == 0:
+                            if align_dict is not None or args.remove_bpe is not None:
+                                # Convert back to tokens for evaluation with unk replacement and/or without BPE
+                                target_tokens = tgt_dict.encode_line(target_str, add_if_not_exist=True)
+                            if hasattr(scorer, 'add_string'):
+                                scorer.add_string(target_str, hypo_str)
+                            else:
+                                scorer.add(target_tokens, hypo_tokens)
 
-            wps_meter.update(num_generated_tokens)
-            t.log({'wps': round(wps_meter.avg)})
-            num_sentences += sample['nsentences']
+                wps_meter.update(num_generated_tokens)
+                t.log({'wps': round(wps_meter.avg)})
+                num_sentences += sample['nsentences']
+        return gen_timer, num_sentences, scorer, has_target 
+        
+    print("-----evaluate-------")
+    if os.environ.get('GLOBAL_PROFILE') == "1": 
+        output_dir = os.environ.get('OUTPUT_DIR')
+        with torch.autograd.profiler.profile() as prof:
+            gen_timer, num_sentences, scorer, has_target = inference(args, itr, generator, models, scorer, gen_timer)
+        table_res = prof.key_averages().table(sort_by="self_cpu_time_total")
+        filename = os.path.join(output_dir + '/result_global.csv')
+        savefile(filename, table_res)
+    else:
+        gen_timer, num_sentences, scorer, has_target = inference(args, itr, generator, models, scorer, gen_timer)
+            
 
     print('| Translated {} sentences ({} tokens) in {:.1f}s ({:.2f} sentences/s, {:.2f} tokens/s)'.format(
         num_sentences, gen_timer.n, gen_timer.sum, num_sentences / gen_timer.sum, 1. / gen_timer.avg))
